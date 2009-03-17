@@ -6,13 +6,12 @@ use HTML::Entities;
 use File::Temp;
 use LWP::Simple;
 use Data::Dumper;
-use Net::Twitter;
 $Data::Dumper::Indent = 1;
 
 use vars qw($VERSION %IRSSI);
 
-$VERSION = "2.0.2";
-my ($REV) = '$Rev: 454 $' =~ /(\d+)/;
+$VERSION = "2.2.0";
+my ($REV) = '$Rev: 559 $' =~ /(\d+)/;
 %IRSSI = (
     authors     => 'Dan Boger',
     contact     => 'zigdon@gmail.com',
@@ -21,19 +20,21 @@ my ($REV) = '$Rev: 454 $' =~ /(\d+)/;
       . 'Can optionally set your bitlbee /away message to same',
     license => 'GNU GPL v2',
     url     => 'http://twirssi.com',
-    changed => '$Date: 2009-02-04 13:35:29 -0800 (Wed, 04 Feb 2009) $',
+    changed => '$Date: 2009-03-16 15:34:12 -0700 (Mon, 16 Mar 2009) $',
 );
 
 my $window;
 my $twit;
 my %twits;
 my $user;
+my $defservice;
 my $poll;
 my $last_poll;
 my %nicks;
 my %friends;
 my %tweet_cache;
 my %id_map;
+my $failwhale            = 0;
 my %irssi_to_mirc_colors = (
     '%k' => '01',
     '%r' => '05',
@@ -78,24 +79,29 @@ sub cmd_direct_as {
         return;
     }
 
-    return unless &valid_username($username);
+    return unless $username = &valid_username($username);
 
     eval {
-        unless ( $twits{$username}
+        if ( $twits{$username}
             ->new_direct_message( { user => $target, text => $text } ) )
         {
+            &notice("DM sent to $target");
+            $nicks{$target} = time;
+        } else {
+            my $error;
+            eval {
+                $error = JSON::Any->jsonToObj( $twits{$username}->get_error() );
+                $error = $error->{error};
+            };
+            die $error if $error;
             &notice("DM to $target failed");
-            return;
         }
     };
 
     if ($@) {
-        &notice("DM caused an error.  Aborted");
+        &notice("DM caused an error: $@");
         return;
     }
-
-    &notice("DM sent to $target");
-    $nicks{$target} = time;
 }
 
 sub cmd_tweet {
@@ -109,7 +115,7 @@ sub cmd_tweet {
         return;
     }
 
-    &cmd_tweet_as( "$user $data", $server, $win );
+    &cmd_tweet_as( "$user\@$defservice $data", $server, $win );
 }
 
 sub cmd_tweet_as {
@@ -118,6 +124,7 @@ sub cmd_tweet_as {
     return unless &logged_in($twit);
 
     $data =~ s/^\s+|\s+$//;
+    $data =~ s/\s\s+/ /g;
     my ( $username, $data ) = split ' ', $data, 2;
 
     unless ( $username and $data ) {
@@ -125,31 +132,24 @@ sub cmd_tweet_as {
         return;
     }
 
-    return unless &valid_username($username);
+    return unless $username = &valid_username($username);
 
-    if ( &too_long( $data, 1 )
-        and Irssi::settings_get_str("short_url_provider") )
-    {
-        foreach my $url ( $data =~ /(https?:\/\/\S+[\w\/])/g ) {
-            eval {
-                my $short = makeashorterlink($url);
-                $data =~ s/\Q$url/$short/g;
-            };
-        }
-    }
+    $data = &shorten($data);
 
     return if &too_long($data);
 
+    my $success = 1;
     eval {
         unless ( $twits{$username}->update($data) )
         {
             &notice("Update failed");
-            return;
+            $success = 0;
         }
     };
+    return unless $success;
 
     if ($@) {
-        &notice("Update caused an error.  Aborted.");
+        &notice("Update caused an error: $@.  Aborted.");
         return;
     }
 
@@ -203,7 +203,7 @@ sub cmd_reply_as {
         return;
     }
 
-    return unless &valid_username($username);
+    return unless $username = &valid_username($username);
 
     my $nick;
     $id =~ s/[^\w\d\-:]+//g;
@@ -226,17 +226,11 @@ sub cmd_reply_as {
         $data = "\@$nick " . $data;
     }
 
-    if ( Irssi::settings_get_str("short_url_provider") ) {
-        foreach my $url ( $data =~ /(https?:\/\/\S+[\w\/])/g ) {
-            eval {
-                my $short = makeashorterlink($url);
-                $data =~ s/\Q$url/$short/g;
-            };
-        }
-    }
+    $data = &shorten($data);
 
     return if &too_long($data);
 
+    my $success = 1;
     eval {
         unless (
             $twits{$username}->update(
@@ -248,12 +242,13 @@ sub cmd_reply_as {
           )
         {
             &notice("Update failed");
-            return;
+            $success = 0;
         }
     };
+    return unless $success;
 
     if ($@) {
-        &notice("Update caused an error.  Aborted");
+        &notice("Update caused an error: $@.  Aborted");
         return;
     }
 
@@ -280,13 +275,15 @@ sub gen_cmd {
             return;
         }
 
+        my $success = 1;
         eval {
             unless ( $twit->$api_name($data) )
             {
                 &notice("$api_name failed");
-                return;
+                $success = 0;
             }
         };
+        return unless $success;
 
         if ($@) {
             &notice("$api_name caused an error.  Aborted.");
@@ -301,10 +298,16 @@ sub cmd_switch {
     my ( $data, $server, $win ) = @_;
 
     $data =~ s/^\s+|\s+$//g;
+    $data = &normalize_username($data);
     if ( exists $twits{$data} ) {
         &notice("Switching to $data");
         $twit = $twits{$data};
-        $user = $data;
+        if ( $data =~ /(.*)\@(.*)/ ) {
+            $user       = $1;
+            $defservice = $2;
+        } else {
+            &notice("Couldn't figure out what service '$data' is on");
+        }
     } else {
         &notice("Unknown user $data");
     }
@@ -315,7 +318,7 @@ sub cmd_logout {
 
     $data =~ s/^\s+|\s+$//g;
     $data = $user unless $data;
-    return unless &valid_username($data);
+    return unless $data = &valid_username($data);
 
     &notice("Logging out $data...");
     $twits{$data}->end_session();
@@ -339,14 +342,26 @@ sub cmd_login {
     {
         my @user = split /\s*,\s*/, $autouser;
         my @pass = split /\s*,\s*/, $autopass;
-        if ( @user != @pass ) {
+
+        # if a password ends with a '\', it was meant to escape the comma, and
+        # it should be concatinated with the next one
+        my @unescaped;
+        while (@pass) {
+            my $p = shift @pass;
+            while ( $p =~ /\\$/ and @pass ) {
+                $p .= "," . shift @pass;
+            }
+            push @unescaped, $p;
+        }
+
+        if ( @user != @unescaped ) {
             &notice("Number of usernames doesn't match "
                   . "the number of passwords - auto-login failed" );
         } else {
             my ( $u, $p );
-            while ( @user and @pass ) {
+            while ( @user and @unescaped ) {
                 $u = shift @user;
-                $p = shift @pass;
+                $p = shift @unescaped;
                 &cmd_login("$u $p");
             }
             return;
@@ -359,14 +374,29 @@ sub cmd_login {
 
     %friends = %nicks = ();
 
-    $twit = Net::Twitter->new(
+    my $service;
+    if ( $user =~ /^(.*)@(twitter|identica)$/ ) {
+        ( $user, $service ) = ( $1, $2 );
+    } else {
+        $service = Irssi::settings_get_str("twirssi_default_service");
+    }
+    $defservice = $service = ucfirst lc $service;
+
+    eval "use Net::$service";
+    if ($@) {
+        &notice(
+            "Failed to load Net::$service when trying to log in as $user: $@");
+        return;
+    }
+
+    $twit = "Net::$service"->new(
         username => $user,
         password => $pass,
         source   => "twirssi"
     );
 
     unless ( $twit->verify_credentials() ) {
-        &notice("Login as $user failed");
+        &notice("Login as $user\@$service failed");
         $twit = undef;
         if ( keys %twits ) {
             &cmd_switch( ( keys %twits )[0], $server, $win );
@@ -384,10 +414,10 @@ sub cmd_login {
             return;
         }
 
-        $twits{$user} = $twit;
+        $twits{"$user\@$service"} = $twit;
         Irssi::timeout_remove($poll) if $poll;
         $poll = Irssi::timeout_add( &get_poll_time * 1000, \&get_updates, "" );
-        &notice("Logged in as $user, loading friends list...");
+        &notice("Logged in as $user\@$service, loading friends list...");
         &load_friends();
         &notice( "loaded friends: ", scalar keys %friends );
         if ( Irssi::settings_get_bool("twirssi_first_run") ) {
@@ -401,7 +431,7 @@ sub cmd_login {
         }
         %nicks = %friends;
         $nicks{$user} = 0;
-        &get_updates;
+        return 1;
     } else {
         &notice("Login failed");
     }
@@ -489,15 +519,8 @@ sub cmd_upgrade {
         return;
     }
 
-    if ( not -x "/usr/bin/md5sum" and not $data ) {
-        &notice(
-"/usr/bin/md5sum can't be found - try '/twirssi_upgrade nomd5' to skip MD5 verification"
-        );
-        return;
-    }
-
     my $md5;
-    unless ($data) {
+    unless ( $data or Irssi::settings_get_bool("twirssi_upgrade_beta") ) {
         eval { use Digest::MD5; };
 
         if ($@) {
@@ -531,11 +554,14 @@ sub cmd_upgrade {
         }
     }
 
-    my $URL = "http://twirssi.com/twirssi.pl";
+    my $URL =
+      Irssi::settings_get_bool("twirssi_upgrade_beta")
+      ? "http://github.com/zigdon/twirssi/raw/master/twirssi.pl"
+      : "http://twirssi.com/twirssi.pl";
     &notice("Downloading twirssi from $URL");
     LWP::Simple::getstore( $URL, "$loc.upgrade" );
 
-    unless ($data) {
+    unless ( $data or Irssi::settings_get_bool("twirssi_upgrade_beta") ) {
         unless ( open( NEW, "$loc.upgrade" ) ) {
             &notice(
 "Failed to read $loc.upgrade.  Check that /set twirssi_location is set to the correct location."
@@ -627,6 +653,7 @@ sub get_updates {
     return unless &logged_in($twit);
 
     my ( $fh, $filename ) = File::Temp::tempfile();
+    binmode( $fh, ":utf8" );
     my $pid = fork();
 
     if ($pid) {    # parent
@@ -640,9 +667,7 @@ sub get_updates {
         my $new_poll = time;
 
         my $error = 0;
-        $error += &do_updates( $fh, $user, $twit );
         foreach ( keys %twits ) {
-            next if $_ eq $user;
             $error += &do_updates( $fh, $_, $twits{$_} );
         }
 
@@ -682,13 +707,11 @@ sub do_updates {
 
     print scalar localtime, " - Polling for updates for $username" if &debug;
     my $tweets;
-    eval {
-        $tweets = $obj->friends_timeline(
-            { since => HTTP::Date::time2str($last_poll) } );
-    };
+    eval { $tweets = $obj->friends_timeline(); };
 
     if ($@) {
-        print $fh "type:debug Error during friends_timeline call.  Aborted.\n";
+        print $fh
+          "type:debug Error during friends_timeline call: $@.  Aborted.\n";
         return 1;
     }
 
@@ -727,6 +750,12 @@ sub do_updates {
                 printf $fh "id:%d account:%s nick:%s type:tweet %s\n",
                   $context->{id}, $username,
                   $context->{user}{screen_name}, $ctext;
+                if ( $context->{truncated} and ref($obj) ne 'Net::Identica' ) {
+                    printf $fh "id:%s account:%s nick:%s type:ellispis %s\n",
+                      $context->{id} . "-url", $username,
+                      $context->{user}{screen_name},
+"http://twitter.com/$context->{user}{screen_name}/status/$context->{id}";
+                }
                 $reply = "reply";
             } elsif ($@) {
                 print $fh "type:debug request to get context failed: $@";
@@ -741,6 +770,12 @@ sub do_updates {
               and not Irssi::settings_get_bool("show_own_tweets");
         printf $fh "id:%d account:%s nick:%s type:%s %s\n",
           $t->{id}, $username, $t->{user}{screen_name}, $reply, $text;
+        if ( $t->{truncated} and ref($obj) ne 'Net::Identica' ) {
+            printf $fh "id:%s account:%s nick:%s type:ellispis %s\n",
+              $t->{id} . "-url", $username,
+              $t->{user}{screen_name},
+              "http://twitter.com/$t->{user}{screen_name}/status/$t->{id}";
+        }
     }
 
     print scalar localtime, " - Polling for replies" if &debug;
@@ -762,6 +797,12 @@ sub do_updates {
         $text = &hilight($text);
         printf $fh "id:%d account:%s nick:%s type:tweet %s\n",
           $t->{id}, $username, $t->{user}{screen_name}, $text;
+        if ( $t->{truncated} ) {
+            printf $fh "id:%s account:%s nick:%s type:ellispis %s\n",
+              $t->{id} . "-url", $username,
+              $t->{user}{screen_name},
+              "http://twitter.com/$t->{user}{screen_name}/status/$t->{id}";
+        }
     }
 
     print scalar localtime, " - Polling for DMs" if &debug;
@@ -837,8 +878,15 @@ sub monitor_child {
     print scalar localtime, " - checking child log at $filename ($attempt)"
       if &debug;
     my $new_last_poll;
+
+    # first time we run we don't want to print out *everything*, so we just
+    # pretend
+    my $suppress = 0;
+    $suppress = 1 unless keys %tweet_cache;
+
     if ( open FILE, $filename ) {
         my @lines;
+        my %new_cache;
         while (<FILE>) {
             chomp;
             last if /^__friends__/;
@@ -850,14 +898,30 @@ sub monitor_child {
                 }
             }
 
-            if (not $meta{type} or $meta{type} ne 'searchid') {
-                next if exists $meta{id} and exists $tweet_cache{ $meta{id} };
-                $tweet_cache{ $meta{id} } = time;
+            if ( not $meta{type} or $meta{type} ne 'searchid' ) {
+                if ( exists $meta{id} and exists $new_cache{ $meta{id} } ) {
+                    next;
+                }
+
+                $new_cache{ $meta{id} } = time;
+
+                if ( exists $meta{id} and exists $tweet_cache{ $meta{id} } ) {
+                    next;
+                }
             }
 
             my $account = "";
-            if ( $meta{account} ne $user ) {
-                $account = "$meta{account}: ";
+            if ( lc $meta{account} ne lc "$user\@$defservice" ) {
+                $meta{account} =~ s/\@(\w+)$//;
+                my $service = $1;
+                if (
+                    lc $service eq
+                    lc Irssi::settings_get_str("twirssi_default_service") )
+                {
+                    $account = "$meta{account}: ";
+                } else {
+                    $account = "$meta{account}\@$service: ";
+                }
             }
 
             my $marker = "";
@@ -874,7 +938,11 @@ sub monitor_child {
 
             my $hilight_color =
               $irssi_to_mirc_colors{ Irssi::settings_get_str("hilight_color") };
-            if ( ($_ =~ /\@$meta{account}\W/i) && Irssi::settings_get_bool("twirssi_hilights") ) {
+            my $nick =
+              '@' . substr( $meta{account}, 0, index( $meta{account}, "@" ) );
+            if ( $_ =~ /\Q$nick\E(?:\W|$)/i
+                and Irssi::settings_get_bool("twirssi_hilights") )
+            {
                 $meta{nick} = "\cC$hilight_color$meta{nick}\cO";
                 $hilight = MSGLEVEL_HILIGHT;
             }
@@ -885,6 +953,9 @@ sub monitor_child {
                     ( MSGLEVEL_PUBLIC | $hilight ),
                     $meta{type}, $account, $meta{nick}, $marker, $_
                   ];
+            } elsif ( $meta{type} eq 'ellispis' ) {
+                push @lines,
+                  [ MSGLEVEL_PUBLIC, "tweet", $account, $meta{nick}, "", $_ ];
             } elsif ( $meta{type} eq 'search' ) {
                 push @lines,
                   [
@@ -892,7 +963,9 @@ sub monitor_child {
                     $meta{type}, $account, $meta{topic},
                     $meta{nick}, $marker,  $_
                   ];
-                if ( $meta{id} >
+                if (
+                    exists $id_map{__searches}{ $meta{account} }{ $meta{topic} }
+                    and $meta{id} >
                     $id_map{__searches}{ $meta{account} }{ $meta{topic} } )
                 {
                     $id_map{__searches}{ $meta{account} }{ $meta{topic} } =
@@ -906,7 +979,9 @@ sub monitor_child {
                   ];
             } elsif ( $meta{type} eq 'searchid' ) {
                 print "Search '$meta{topic}' returned id $meta{id}" if &debug;
-                if ( $meta{id} >=
+                if (
+                    exists $id_map{__searches}{ $meta{account} }{ $meta{topic} }
+                    and $meta{id} >=
                     $id_map{__searches}{ $meta{account} }{ $meta{topic} } )
                 {
                     $id_map{__searches}{ $meta{account} }{ $meta{topic} } =
@@ -935,12 +1010,16 @@ sub monitor_child {
 
         if ($new_last_poll) {
             print "new last_poll = $new_last_poll" if &debug;
-            for my $line (@lines) {
-                $window->printformat(
-                    $line->[0],
-                    "twirssi_" . $line->[1],
-                    @$line[ 2 .. $#$line ]
-                );
+            if ($suppress) {
+                print "First call, not printing updates" if &debug;
+            } else {
+                foreach my $line (@lines) {
+                    $window->printformat(
+                        $line->[0],
+                        "twirssi_" . $line->[1],
+                        @$line[ 2 .. $#$line ]
+                    );
+                }
             }
 
             close FILE;
@@ -948,9 +1027,13 @@ sub monitor_child {
               or warn "Failed to remove $filename: $!"
               unless &debug;
 
+            # commit the pending cache lines to the actual cache, now that
+            # we've printed our output
+            %tweet_cache = ( %tweet_cache, %new_cache );
+
             # keep enough cached tweets, to make sure we don't show duplicates.
             foreach ( keys %tweet_cache ) {
-                next if $tweet_cache{$_} >= $last_poll;
+                next if $tweet_cache{$_} >= $last_poll - 3600;
                 delete $tweet_cache{$_};
             }
             $last_poll = $new_last_poll;
@@ -964,21 +1047,50 @@ sub monitor_child {
                     print JSON JSON::Any->objToJson( \%id_map );
                     close JSON;
                 } else {
-                    &notice("Failed to write replies to $file: $!");
+                    &ccrap("Failed to write replies to $file: $!");
                 }
             }
+            $failwhale = 0;
             return;
         }
     }
 
     close FILE;
 
-    if ( $attempt < 12 ) {
+    if ( $attempt < 24 ) {
         Irssi::timeout_add_once( 5000, 'monitor_child',
             [ $filename, $attempt + 1 ] );
     } else {
-        &notice("Giving up on polling $filename");
+        print "Giving up on polling $filename" if &debug;
         unlink $filename unless &debug;
+
+        return unless Irssi::settings_get_bool("twirssi_notify_timeouts");
+
+        my $since;
+        my @time = localtime($last_poll);
+        if ( time - $last_poll < 24 * 60 * 60 ) {
+            $since = sprintf( "%d:%02d", @time[ 2, 1 ] );
+        } else {
+            $since = scalar localtime($last_poll);
+        }
+
+        if ( not $failwhale and time - $last_poll > 60 * 60 ) {
+            foreach my $whale (
+                q{     v  v        v},
+                q{     |  |  v     |  v},
+                q{     | .-, |     |  |},
+                q{  .--./ /  |  _.---.| },
+                q{   '-. (__..-"       \\},
+                q{      \\          a    |},
+                q{       ',.__.   ,__.-'/},
+                q{         '--/_.'----'`}
+              )
+            {
+                &ccrap($whale);
+            }
+            $failwhale = 1;
+        }
+        &ccrap("Haven't been able to get updated tweets since $since");
     }
 }
 
@@ -988,6 +1100,10 @@ sub debug {
 
 sub notice {
     $window->print( "%R***%n @_", MSGLEVEL_PUBLIC );
+}
+
+sub ccrap {
+    $window->print( "%R***%n @_", MSGLEVEL_CLIENTCRAP );
 }
 
 sub update_away {
@@ -1003,7 +1119,7 @@ sub update_away {
             $server->send_raw("away :$data");
             return 1;
         } else {
-            &notice( "Can't find bitlbee server.",
+            &ccrap( "Can't find bitlbee server.",
                 "Update bitlbee_server or disable tweet_to_away" );
             return 0;
         }
@@ -1028,12 +1144,14 @@ sub too_long {
 sub valid_username {
     my $username = shift;
 
+    $username = &normalize_username($username);
+
     unless ( exists $twits{$username} ) {
         &notice("Unknown username $username");
-        return 0;
+        return undef;
     }
 
-    return 1;
+    return $username;
 }
 
 sub logged_in {
@@ -1056,8 +1174,10 @@ sub sig_complete {
       )
     {    # /twitter_reply gets a nick:num
         $word =~ s/^@//;
-        @$complist = map { "$_:$id_map{__indexes}{$_}" } grep /^\Q$word/i,
-          sort keys %{ $id_map{__indexes} };
+        @$complist = map { "$_:$id_map{__indexes}{$_}" }
+          sort { $nicks{$b} <=> $nicks{$a} }
+          grep /^\Q$word/i,
+          keys %{ $id_map{__indexes} };
     }
 
     # /tweet, /tweet_as, /dm, /dm_as - complete @nicks (and nicks as the first
@@ -1093,11 +1213,87 @@ sub get_poll_time {
 sub hilight {
     my $text = shift;
 
-    $text =~ s/(^|\W)\@([-\w]+)/$1\cC12\@$2\cO/g;
-    $text =~ s/(^|\W)\#([-\w]+)/$1\cC5\#$2\cO/g;
+    if ( Irssi::settings_get_str("twirssi_nick_color") ) {
+        my $c = Irssi::settings_get_str("twirssi_nick_color");
+        $c = $irssi_to_mirc_colors{$c};
+        $text =~ s/(^|\W)\@([-\w]+)/$1\cC$c\@$2\cO/g if $c;
+    }
+    if ( Irssi::settings_get_str("twirssi_topic_color") ) {
+        my $c = Irssi::settings_get_str("twirssi_topic_color");
+        $c = $irssi_to_mirc_colors{$c};
+        $text =~ s/(^|\W)\#([-\w]+)/$1\cC$c\#$2\cO/g if $c;
+    }
     $text =~ s/[\n\r]/ /g;
 
     return $text;
+}
+
+sub shorten {
+    my $data = shift;
+
+    my $provider = Irssi::settings_get_str("short_url_provider");
+    if (
+        (
+            Irssi::settings_get_bool("twirssi_always_shorten")
+            or &too_long( $data, 1 )
+        )
+        and $provider
+      )
+    {
+        my @args;
+        if ( $provider eq 'Bitly' ) {
+            @args[ 1, 2 ] = split ',',
+              Irssi::settings_get_str("short_url_args"), 2;
+            unless ( @args == 3 ) {
+                &ccrap(
+                    "WWW::Shorten::Bitly requires a username and API key.",
+                    "Set short_url_args to username,API_key or change your",
+                    "short_url_provider."
+                );
+                return $data;
+            }
+        }
+
+        foreach my $url ( $data =~ /(https?:\/\/\S+[\w\/])/g ) {
+            eval {
+                $args[0] = $url;
+                my $short = makeashorterlink(@args);
+                if ($short) {
+                    $data =~ s/\Q$url/$short/g;
+                } else {
+                    &notice("Failed to shorten $url!");
+                }
+            };
+        }
+    }
+
+    return $data;
+}
+
+sub normalize_username {
+    my $user = shift;
+
+    my ( $username, $service ) = split /\@/, $user, 2;
+    if ($service) {
+        $service = ucfirst lc $service;
+    } else {
+        $service =
+          ucfirst lc Irssi::settings_get_str("twirssi_default_service");
+        unless ( exists $twits{"$username\@$service"} ) {
+            $service = undef;
+            foreach my $t ( sort keys %twits ) {
+                next unless $t =~ /^\Q$username\E\@(Twitter|Identica)/;
+                $service = $1;
+                last;
+            }
+
+            unless ($service) {
+                &notice("Can't find a logged in user '$user'");
+            }
+        }
+    }
+
+    return "$username\@$service";
 }
 
 Irssi::signal_add( "send text", "event_send_text" );
@@ -1113,15 +1309,20 @@ Irssi::theme_register(
 );
 
 Irssi::settings_add_int( "twirssi", "twitter_poll_interval", 300 );
-Irssi::settings_add_str( "twirssi", "twitter_window",     "twitter" );
-Irssi::settings_add_str( "twirssi", "bitlbee_server",     "bitlbee" );
-Irssi::settings_add_str( "twirssi", "short_url_provider", "TinyURL" );
+Irssi::settings_add_str( "twirssi", "twitter_window",          "twitter" );
+Irssi::settings_add_str( "twirssi", "bitlbee_server",          "bitlbee" );
+Irssi::settings_add_str( "twirssi", "short_url_provider",      "TinyURL" );
+Irssi::settings_add_str( "twirssi", "short_url_args",          undef );
+Irssi::settings_add_str( "twirssi", "twitter_usernames",       undef );
+Irssi::settings_add_str( "twirssi", "twitter_passwords",       undef );
+Irssi::settings_add_str( "twirssi", "twirssi_default_service", "Twitter" );
+Irssi::settings_add_str( "twirssi", "twirssi_nick_color",      "%B" );
+Irssi::settings_add_str( "twirssi", "twirssi_topic_color",     "%r" );
 Irssi::settings_add_str( "twirssi", "twirssi_location",
     ".irssi/scripts/twirssi.pl" );
-Irssi::settings_add_str( "twirssi", "twitter_usernames", undef );
-Irssi::settings_add_str( "twirssi", "twitter_passwords", undef );
 Irssi::settings_add_str( "twirssi", "twirssi_replies_store",
     ".irssi/scripts/twirssi.json" );
+Irssi::settings_add_bool( "twirssi", "twirssi_upgrade_beta",      0 );
 Irssi::settings_add_bool( "twirssi", "tweet_to_away",             0 );
 Irssi::settings_add_bool( "twirssi", "show_reply_context",        0 );
 Irssi::settings_add_bool( "twirssi", "show_own_tweets",           1 );
@@ -1130,12 +1331,18 @@ Irssi::settings_add_bool( "twirssi", "twirssi_first_run",         1 );
 Irssi::settings_add_bool( "twirssi", "twirssi_track_replies",     1 );
 Irssi::settings_add_bool( "twirssi", "twirssi_replies_autonick",  1 );
 Irssi::settings_add_bool( "twirssi", "twirssi_use_reply_aliases", 0 );
+Irssi::settings_add_bool( "twirssi", "twirssi_notify_timeouts",   1 );
 Irssi::settings_add_bool( "twirssi", "twirssi_hilights",          1 );
+Irssi::settings_add_bool( "twirssi", "twirssi_always_shorten",    0 );
 Irssi::settings_add_bool( "twirssi", "tweet_window_input",        0 );
 
 $last_poll = time - &get_poll_time;
 $window = Irssi::window_find_name( Irssi::settings_get_str('twitter_window') );
 if ( !$window ) {
+    Irssi::active_win()
+      ->print( "Couldn't find a window named '"
+          . Irssi::settings_get_str('twitter_window')
+          . "', trying to create it." );
     $window =
       Irssi::Windowitem::window_create(
         Irssi::settings_get_str('twitter_window'), 1 );
@@ -1156,6 +1363,7 @@ if ($window) {
     Irssi::command_bind( "twitter_unsubscribe",        "cmd_del_search" );
     Irssi::command_bind( "twitter_list_subscriptions", "cmd_list_search" );
     Irssi::command_bind( "twirssi_upgrade",            "cmd_upgrade" );
+    Irssi::command_bind( "twitter_updates",            "get_updates" );
     if ( Irssi::settings_get_bool("twirssi_use_reply_aliases") ) {
         Irssi::command_bind( "reply",    "cmd_reply" );
         Irssi::command_bind( "reply_as", "cmd_reply_as" );
@@ -1164,11 +1372,17 @@ if ($window) {
         "twirssi_dump",
         sub {
             print "twits: ", join ", ",
-              map { "u: $_->{username}" } values %twits;
+              map { "u: $_->{username}\@" . ref($_) } values %twits;
+            print "selected: $user\@$defservice";
             print "friends: ", join ", ", sort keys %friends;
             print "nicks: ",   join ", ", sort keys %nicks;
             print "searches: ", Dumper \%{ $id_map{__searches} };
             print "last poll: $last_poll";
+            if ( open DUMP, ">/tmp/twirssi.cache.txt" ) {
+                print DUMP Dumper \%tweet_cache;
+                close DUMP;
+                print "cache written out to /tmp/twirssi.cache.txt";
+            }
         }
     );
     Irssi::command_bind(
@@ -1197,7 +1411,14 @@ if ($window) {
             sub { &notice("Stopped following $_[0]"); delete $nicks{ $_[0] }; }
         )
     );
-    Irssi::command_bind( "twitter_updates", "get_updates" );
+    Irssi::command_bind(
+        "twitter_device_updates",
+        &gen_cmd(
+            "/twitter_device_updates none|im|sms",
+            "update_delivery_device",
+            sub { &notice("Device updated to $_[0]"); }
+        )
+    );
     Irssi::signal_add_last( 'complete word' => \&sig_complete );
 
     &notice("  %Y<%C(%B^%C)%N                   TWIRSSI v%R$VERSION%N (r$REV)");
@@ -1217,6 +1438,7 @@ if ($window) {
                 my $num = keys %{ $id_map{__indexes} };
                 &notice( sprintf "Loaded old replies from %d contact%s.",
                     $num, ( $num == 1 ? "" : "s" ) );
+                &cmd_list_search;
             };
         } else {
             &notice("Failed to load old replies from $file: $!");
@@ -1224,11 +1446,13 @@ if ($window) {
     }
 
     if ( my $provider = Irssi::settings_get_str("short_url_provider") ) {
+        &notice("Loading WWW::Shorten::$provider...");
         eval "use WWW::Shorten::$provider;";
 
         if ($@) {
             &notice(
-"Failed to load WWW::Shorten::$provider - either clear short_url_provider or install the CPAN module"
+                "Failed to load WWW::Shorten::$provider - either clear",
+                "short_url_provider or install the CPAN module"
             );
         }
     }
@@ -1237,6 +1461,7 @@ if ($window) {
         and my $autopass = Irssi::settings_get_str("twitter_passwords") )
     {
         &cmd_login();
+        &get_updates;
     }
 
 } else {
