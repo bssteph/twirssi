@@ -10,8 +10,8 @@ $Data::Dumper::Indent = 1;
 
 use vars qw($VERSION %IRSSI);
 
-$VERSION = "2.2.3beta";
-my ($REV) = '$Rev: 619 $' =~ /(\d+)/;
+$VERSION = "2.2.3";
+my ($REV) = '$Rev: 643 $' =~ /(\d+)/;
 %IRSSI = (
     authors     => 'Dan Boger',
     contact     => 'zigdon@gmail.com',
@@ -20,7 +20,7 @@ my ($REV) = '$Rev: 619 $' =~ /(\d+)/;
       . 'Can optionally set your bitlbee /away message to same',
     license => 'GNU GPL v2',
     url     => 'http://twirssi.com',
-    changed => '$Date: 2009-04-25 11:08:58 -0700 (Sat, 25 Apr 2009) $',
+    changed => '$Date: 2009-05-21 14:13:27 -0700 (Thu, 21 May 2009) $',
 );
 
 my $window;
@@ -183,7 +183,7 @@ sub cmd_retweet_as {
             $twits{$username}->update(
                 {
                     status                => $data,
-                    in_reply_to_status_id => $id_map{ lc $nick }[$id]
+                    # in_reply_to_status_id => $id_map{ lc $nick }[$id]
                 }
             )
           )
@@ -801,6 +801,8 @@ sub get_updates {
         }
         close $fh;
         exit;
+    } else {
+        &ccrap("Failed to fork for updating: $!");
     }
     print scalar localtime, " - get_updates ends" if &debug;
 }
@@ -1239,7 +1241,10 @@ sub monitor_child {
             }
             $failwhale = 1;
         }
-        &ccrap("Haven't been able to get updated tweets since $since");
+
+        if ( time - $last_poll < 600 ) {
+            &ccrap("Haven't been able to get updated tweets since $since");
+        }
     }
 }
 
