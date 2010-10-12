@@ -1752,7 +1752,7 @@ sub monitor_child {
                 print "First call, not printing updates" if &debug;
             } else {
                 foreach my $line (@lines) {
-                    &window( $line->[1], $line->[2] )->printformat(
+                    &window( $line->[1], $line->[2], $line->[3] )->printformat(
                         $line->[0],
                         "twirssi_" . $line->[1],
                         @$line[ 2 .. $#$line - 1 ],
@@ -2107,6 +2107,7 @@ sub get_text {
 sub window {
     my $type  = shift || "default";
     my $uname = shift || "default";
+    my $subj  = shift || "default";
 
     $type = "search" if $type eq 'search_once';
 
@@ -2114,6 +2115,7 @@ sub window {
     if ( exists $state{__windows}{$type} ) {
         $win =
              $state{__windows}{$type}{$uname}
+          || $state{__windows}{$type}{$subj}
           || $state{__windows}{$type}{$user}
           || $state{__windows}{$type}{default}
           || Irssi::settings_get_str('twitter_window');
