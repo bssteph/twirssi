@@ -1752,7 +1752,7 @@ sub monitor_child {
                 print "First call, not printing updates" if &debug;
             } else {
                 foreach my $line (@lines) {
-                    &window( $line->[1], $line->[3] )->printformat(
+                    &window( $line->[1], $line->[2] )->printformat(
                         $line->[0],
                         "twirssi_" . $line->[1],
                         @$line[ 2 .. $#$line - 1 ],
